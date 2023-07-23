@@ -7,8 +7,10 @@ from torch.nn import functional as F
 import commons
 import modules
 import attentions
-import monotonic_align
-
+try:
+    import monotonic_align
+except:
+    print("import monotonic align failed")
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
 
@@ -445,6 +447,51 @@ class ReferenceEncoder(nn.Module):
             L = (L - kernel_size + 2 * pad) // stride + 1
         return L
 
+class F0Predictor(nn.Module):
+    def __init__(self,
+                 hidden_channels,
+                 filter_channels,
+                 n_heads,
+                 n_layers,
+                 kernel_size,
+                 p_dropout,
+                 out_channels,
+                 ):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.out_channels = out_channels
+
+        self.enc_f0 = attentions.FFT(
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            4,
+            kernel_size,
+            p_dropout)
+        self.proj_f0 = nn.Conv1d(hidden_channels, 1, 1)
+        self.f0_emb = nn.Conv1d(2, hidden_channels, 1)
+
+    def forward(self,x, x_mask, f0=None, pitch_ratio=None):
+        x = self.enc_f0(x * x_mask, x_mask)
+        pred_lf0 = self.proj_f0(x)
+
+        if f0 != None:
+            gt_lf0 = 2595. * torch.log10(1. + f0 / 700.) / 500
+            assert pred_lf0.shape == gt_lf0.shape, (pred_lf0.shape, gt_lf0.shape)
+            loss = F.mse_loss(gt_lf0, pred_lf0)
+            return gt_lf0, pred_lf0, loss
+        else:
+            pred_lf0 *= pitch_ratio
+            pred_f0 = pred_lf0 * 500
+            pred_f0 = pred_f0 / 2595
+            pred_f0 = torch.pow(10, pred_f0)
+            pred_f0 = (pred_f0 - 1) * 700.
+            return pred_lf0, pred_f0
 
 class SynthesizerTrn(nn.Module):
     """
@@ -517,7 +564,22 @@ class SynthesizerTrn(nn.Module):
         else:
             self.ref_enc = ReferenceEncoder(spec_channels, gin_channels)
 
-    def forward(self, x, x_lengths, y, y_lengths, sid, tone, language, bert):
+        self.pitch_extractor = F0Predictor(hidden_channels,
+                                           filter_channels,
+                                           n_heads,
+                                           n_layers,
+                                           kernel_size,
+                                           p_dropout,
+                                           inter_channels
+                                           )
+        pitch_embedding_kernel_size = 3
+        self.f0_proj = nn.Conv1d(
+            1,
+            gin_channels,
+            kernel_size=pitch_embedding_kernel_size,
+            padding=int((pitch_embedding_kernel_size - 1) / 2),
+        )
+    def forward(self, x, x_lengths, y, y_lengths, sid, tone, language, bert, f0):
 
         x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, tone, language, bert)
         if self.n_speakers > 0:
@@ -526,7 +588,10 @@ class SynthesizerTrn(nn.Module):
             g = self.ref_enc(y.transpose(1,2)).unsqueeze(-1)
 
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
-        z_p = self.flow(z, y_mask, g=g)
+        f0 = f0.unsqueeze(1)
+        gt_lf0 = 2595. * torch.log10(1. + f0 / 700.) / 500
+        f0_embedding = self.f0_proj(gt_lf0)
+        z_p = self.flow(z, y_mask, g=(g+f0_embedding))
 
         with torch.no_grad():
             # negative cross-entropy
@@ -555,12 +620,16 @@ class SynthesizerTrn(nn.Module):
         # expand prior
         m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
         logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
+        x = torch.matmul(attn.squeeze(1), x.transpose(1, 2)).transpose(1, 2)
+
+        gt_lf0, pred_lf0, loss_f0 = self.pitch_extractor(x, y_mask, f0)
+
 
         z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
         o = self.dec(z_slice, g=g)
-        return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+        return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), gt_lf0, pred_lf0, loss_f0
 
-    def infer(self, x, x_lengths, sid, tone, language, bert, noise_scale=.667, length_scale=1, noise_scale_w=0.8, max_len=None, sdp_ratio=0,y=None):
+    def infer(self, x, x_lengths, sid, tone, language, bert, noise_scale=.667, length_scale=1, noise_scale_w=0.8, max_len=None, sdp_ratio=0,y=None,  pitch_ratio=1):
         x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, tone, language, bert)
         # g = self.gst(y)
         if self.n_speakers > 0:
@@ -577,11 +646,15 @@ class SynthesizerTrn(nn.Module):
         attn = commons.generate_path(w_ceil, attn_mask)
 
         m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)  # [b, t', t], [b, t, d] -> [b, d, t']
-        logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1,
-                                                                                 2)  # [b, t', t], [b, t, d] -> [b, d, t']
+        logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1,2)  # [b, t', t], [b, t, d] -> [b, d, t']
+        x = torch.matmul(attn.squeeze(1), x.transpose(1, 2)).transpose(1,2)  # [b, t', t], [b, t, d] -> [b, d, t']
 
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
-        z = self.flow(z_p, y_mask, g=g, reverse=True)
+
+        pred_lf0, pred_f0 = self.pitch_extractor(x, y_mask, pitch_ratio=pitch_ratio)
+        f0_embedding = self.f0_proj(pred_lf0)
+
+        z = self.flow(z_p, y_mask, g=(g+f0_embedding), reverse=True)
         o = self.dec((z * y_mask)[:, :, :max_len], g=g)
         return o, attn, y_mask, (z, z_p, m_p, logs_p)
 

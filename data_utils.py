@@ -70,7 +70,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         spec, wav = self.get_audio(audiopath)
         sid = torch.LongTensor([int(self.spk_map[sid])])
-        return (phones, spec, wav, sid, tone, language, bert)
+        f0 = self.get_f0(audiopath, spec.shape[-1])
+
+        return (phones, spec, wav, sid, tone, language, bert, f0)
 
     def get_audio(self, filename):
         audio, sampling_rate = load_wav_to_torch(filename)
@@ -126,6 +128,50 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         sid = torch.LongTensor([int(sid)])
         return sid
 
+    def get_f0(self, wav_path, sumdur):
+        f0_path = wav_path.replace(".wav", ".f0.npy")
+        try:
+            assert os.path.exists(f0_path)
+            f0 = np.load(f0_path)
+            assert f0.shape[0] == sumdur
+        except:
+            f0 = self.get_pitch(wav_path, sumdur)
+            assert len(f0.shape) == 1
+            np.save(f0_path, f0)
+            assert f0.shape[0] == sumdur
+
+        f0 = torch.FloatTensor(f0)
+        return f0
+
+    def get_pitch(self, path, lll):
+        import librosa
+        import parselmouth
+        """
+        :param wav_data: [T]
+        :param mel: [T, 80]
+        :param config:
+        :return:
+        """
+        fs = self.hps.sampling_rate
+        hop = self.hop_length
+        sampling_rate = fs
+        hop_length = hop
+        wav_data, _ = librosa.load(path, sampling_rate)
+        time_step = hop_length / sampling_rate * 1000
+        f0_min = 80
+        f0_max = 750
+
+        f0 = parselmouth.Sound(wav_data, sampling_rate).to_pitch_ac(
+            time_step=time_step / 1000, voicing_threshold=0.6,
+            pitch_floor=f0_min, pitch_ceiling=f0_max).selected_array["frequency"]
+        lpad = 2
+        rpad = lll - len(f0) - lpad
+        assert 0 <= rpad <= 2, (len(f0), lll, len(wav_data) // hop_length)
+        assert 0 <= (lll - len(wav_data) // hop_length) <= 1
+        f0 = np.pad(f0, [[lpad, rpad]], mode="constant")
+
+        return f0
+
     def __getitem__(self, index):
         return self.get_audio_text_speaker_pair(self.audiopaths_sid_text[index])
 
@@ -163,6 +209,7 @@ class TextAudioSpeakerCollate():
         tone_padded = torch.LongTensor(len(batch), max_text_len)
         language_padded = torch.LongTensor(len(batch), max_text_len)
         bert_padded = torch.FloatTensor(len(batch), 1024, max_text_len)
+        f0_padded = torch.FloatTensor(len(batch), max_spec_len)
 
         spec_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), max_spec_len)
         wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
@@ -172,6 +219,8 @@ class TextAudioSpeakerCollate():
         spec_padded.zero_()
         wav_padded.zero_()
         bert_padded.zero_()
+        f0_padded.zero_()
+
         for i in range(len(ids_sorted_decreasing)):
             row = batch[ids_sorted_decreasing[i]]
 
@@ -198,7 +247,11 @@ class TextAudioSpeakerCollate():
             bert = row[6]
             bert_padded[i, :, :bert.size(1)] = bert
 
-        return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, sid, tone_padded, language_padded, bert_padded
+            f0 = row[7]
+            f0_padded[i, :f0.size(0)] = f0
+
+
+        return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, sid, tone_padded, language_padded, bert_padded, f0_padded
 
 
 class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
